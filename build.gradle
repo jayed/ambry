@@ -11,20 +11,29 @@
 buildscript {
     repositories {
         mavenCentral()
+        mavenLocal()
     }
     apply from: file('gradle/buildscript.gradle'), to: buildscript
 }
 
+apply plugin: 'org.shipkit.shipkit-auto-version'
+println "Building version $version"
+
 apply from: file('gradle/license.gradle')
 apply from: file('gradle/environment.gradle')
 apply from: file("gradle/dependency-versions.gradle")
+if (!project.hasProperty('disableShipkit')) {
+    apply from: file("gradle/ci-release.gradle")
+}
 
 allprojects {
     group = "com.github.ambry"
+    version = rootProject.version //TODO: fix in https://github.com/shipkit/org.shipkit.shipkit-auto-version
 
     apply plugin: 'eclipse'
     apply plugin: 'idea'
     apply plugin: 'project-report'
+    apply plugin: 'jacoco'
 
     repositories {
         mavenCentral()
@@ -35,71 +44,169 @@ allprojects {
 subprojects {
     apply plugin: 'java'
 
+    if (!project.hasProperty('disableShipkit')) {
+      apply from: "$rootDir/gradle/java-publishing.gradle"
+    }
+
+    sourceCompatibility = 1.8
+    targetCompatibility = 1.8
+
     sourceSets {
-        test {
+        // separate source set for integration tests
+        intTest {
             java.srcDir file('src/integration-test/java')
             resources.srcDir file('src/integration-test/resources')
-        }
-        unitTest {
-            java.srcDir file('src/test/java')
-            resources.srcDir file('src/test/resources')
+            compileClasspath += sourceSets.main.output + sourceSets.test.output
+            runtimeClasspath += sourceSets.main.output + sourceSets.test.output
         }
     }
-    
+
+    configurations {
+        // This configuration allows for test suites to properly depend on utility classes in other subprojects.
+        // Dependencies should be included in the classpath when depending on testArtifacts in another subproject
+        testArchives.extendsFrom testRuntime
+
+        // These configurations allow for the integration test source set to be compiled and run as a test suite.
+        // Integration tests should be able to get the same dependencies as the corresponding unit tests.
+        intTestCompile.extendsFrom testCompile
+        intTestRuntime.extendsFrom testRuntime
+    }
+
+    // this test jar is used to represent a test dependency for a subproject, since depending directly on a source set
+    // does not guarantee that the source set was actually built.
+    task testJar(type: Jar, dependsOn: testClasses) {
+        classifier = 'test'
+        from sourceSets.test.output
+    }
+
+    artifacts {
+        // Depending on a jar instead of the source set directly prevents test subprojects from compiling before their
+        // dependencies are built.
+        testArchives testJar
+    }
+
     dependencies {
-        compile "log4j:log4j:$log4jVersion"
         compile "org.slf4j:slf4j-api:$slf4jVersion"
-        compile "org.slf4j:slf4j-log4j12:$slf4jVersion"
+        testCompile "log4j:log4j:$log4jVersion"
+        testCompile "org.slf4j:slf4j-log4j12:$slf4jVersion"
         testCompile "junit:junit:$junitVersion"
-        unitTestCompile sourceSets.main.output
-        unitTestCompile sourceSets.test.output
-        unitTestCompile configurations.testCompile
-        unitTestRuntime configurations.testRuntime
+        testCompile "org.mockito:mockito-core:2.+"
+        testRuntime project(':log4j-test-config')
+    }
+
+    idea {
+        // since integration tests are in a separate source set, we have to tell intellij about them
+        module {
+            testSourceDirs += sourceSets.intTest.java.srcDirs
+            testResourceDirs += sourceSets.intTest.resources.srcDirs
+            scopes.TEST.plus += [configurations.intTestCompile]
+        }
     }
 
     test {
         testLogging {
             exceptionFormat = 'full'
         }
+        maxHeapSize = "3g"
+        systemProperty 'io.netty.leakDetection.level', 'paranoid'
+        systemProperty 'io.netty.allocator.tinyCacheSize', '0'
+        systemProperty 'io.netty.allocator.smallCacheSize', '0'
+        systemProperty 'io.netty.allocator.normalCacheSize', '0'
+        systemProperty 'io.netty.allocator.maxCachedBufferCapacity', '0'
+        systemProperty 'io.netty.leakDetection.acquireAndReleaseOnly', 'true'
     }
 
-    task unitTest(type: Test) {
+    task intTest(type: Test) {
+        description = 'Runs integration tests.'
+        group = 'verification'
+        testClassesDirs = sourceSets.intTest.output.classesDirs
+        classpath = sourceSets.intTest.runtimeClasspath
         testLogging {
             exceptionFormat = 'full'
+            events 'started', 'failed', 'passed', 'skipped'
+            showStandardStreams = false
         }
-        testClassesDir = sourceSets.unitTest.output.classesDir
-        classpath += sourceSets.unitTest.runtimeClasspath
+        maxHeapSize = "3g"
+        systemProperty 'io.netty.leakDetection.level', 'paranoid'
     }
-    
-    // only run unit tests when doing a standard build,
-    // but run integration tests too when running the test target
-    check.dependsOn -= test
-    check.dependsOn += unitTest
+
+    task allTest {
+        description = 'Runs unit and integration tests'
+        group = 'verification'
+    }
+    allTest.dependsOn test
+    allTest.dependsOn intTest
+
+    javadoc {
+        // TODO audit and fix our javadocs so that we don't need this setting
+        // This is mainly for cases where param/throws tags don't have descriptions
+        // Previously, javadocs weren't being compiled, but now shipkit automatically enables this build step
+        options.addStringOption('Xdoclint:none', '-quiet') // Suppress lint warnings
+        failOnError = false
+    }
 }
 
 project(':ambry-utils') {
     dependencies {
+        compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
         compile "commons-codec:commons-codec:$commonsVersion"
         compile "org.json:json:$jsonVersion"
         compile "net.sf.jopt-simple:jopt-simple:$joptSimpleVersion"
+        compile "io.netty:netty-buffer:$nettyVersion"
+        testCompile "org.apache.helix:helix-core:$helixVersion"
+        testCompile project(":ambry-test-utils")
+    }
+}
+
+project(':ambry-test-utils') {
+    dependencies {
+        compile "junit:junit:$junitVersion"
+        compile "org.mockito:mockito-core:2.+"
+        compile project(":ambry-utils")
+        compile project(":ambry-api")
+        compile project(":ambry-commons")
+        compile "org.bouncycastle:bcpkix-jdk15on:$bouncycastleVersion"
     }
 }
 
 project(':ambry-api') {
     dependencies {
         compile project(':ambry-utils')
-        compile "com.codahale.metrics:metrics-core:$metricsVersion"
-        testCompile project(':ambry-utils').sourceSets.test.output
+        compile ("org.apache.helix:helix-core:$helixVersion") {
+            exclude group: "log4j", module: "log4j"
+        }
+        compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
+        compile "org.codehaus.jackson:jackson-core-asl:$jacksonVersion"
+        compile "org.codehaus.jackson:jackson-mapper-asl:$jacksonVersion"
+        compile "io.netty:netty-buffer:$nettyVersion"
+        testCompile project(':ambry-clustermap')
+        testCompile project(':ambry-test-utils')
+    }
+}
+
+project(':ambry-account') {
+    dependencies {
+        compile project(':ambry-api'),
+                project(':ambry-utils'),
+                project(':ambry-commons')
+        compile "org.apache.helix:helix-core:$helixVersion"
+        compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
+        compile "org.json:json:$jsonVersion"
+        testCompile project(':ambry-test-utils')
+        testCompile project(path: ':ambry-clustermap', configuration: 'testArchives')
+        testCompile "com.google.jimfs:jimfs:$jimFsVersion"
     }
 }
 
 project(':ambry-clustermap') {
     dependencies {
         compile project(':ambry-api'),
-                project(':ambry-metrics'),
                 project(':ambry-utils')
-        compile "com.codahale.metrics:metrics-core:$metricsVersion"
+        compile "org.apache.helix:helix-core:$helixVersion"
+        compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
         compile "org.json:json:$jsonVersion"
+        testCompile project(':ambry-commons')
+        testCompile project(':ambry-test-utils')
     }
 }
 
@@ -109,50 +216,64 @@ project(':ambry-commons') {
                 project(':ambry-clustermap'),
                 project(':ambry-messageformat'),
                 project(':ambry-utils')
-        testCompile project(':ambry-clustermap').sourceSets.test.output
+        compile "org.conscrypt:conscrypt-openjdk-uber:$conscryptVersion"
+        compile "io.netty:netty-all:$nettyVersion"
+        compile "io.netty:netty-tcnative-boringssl-static:$nettyTcnativeVersion"
+        testCompile project(':ambry-test-utils')
+        testCompile project(path: ':ambry-clustermap', configuration: 'testArchives')
     }
 }
 
 project(':ambry-network') {
     dependencies {
         compile project(':ambry-api'),
-                project(':ambry-utils')
-        compile "com.codahale.metrics:metrics-core:$metricsVersion"
-        testCompile "org.bouncycastle:bcpkix-jdk15on:$bouncycastleVersion"
-        testCompile project(':ambry-utils').sourceSets.test.output
+                project(':ambry-utils'),
+                project(':ambry-commons'),
+                project(':ambry-clustermap')
+        compile "io.netty:netty-all:$nettyVersion"
+        compile "io.netty:netty-tcnative-boringssl-static:$nettyTcnativeVersion"
+        compile "io.netty:netty-transport-native-epoll:$nettyVersion"
+        compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
+        testCompile project(':ambry-test-utils')
     }
 }
 
 project(':ambry-server') {
     dependencies {
         compile project(':ambry-clustermap'),
-                project(':ambry-coordinator'),
                 project(':ambry-messageformat'),
-                project(':ambry-metrics'),
                 project(':ambry-network'),
                 project(':ambry-protocol'),
                 project(':ambry-commons'),
                 project(':ambry-store'),
                 project(':ambry-utils'),
+                project(':ambry-rest'),
                 project(':ambry-replication')
-        compile "com.codahale.metrics:metrics-core:$metricsVersion"
-        testCompile project(':ambry-router').sourceSets.main.output
-        testCompile project(':ambry-utils').sourceSets.test.output
-        testCompile project(':ambry-clustermap').sourceSets.test.output
-        testCompile project(':ambry-network').sourceSets.test.output
-        testCompile "org.bouncycastle:bcpkix-jdk15on:$bouncycastleVersion"
+        compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
+        compile "io.dropwizard.metrics:metrics-jmx:$metricsVersion"
+        runtimeOnly "log4j:log4j:$log4jVersion"
+        runtimeOnly "org.slf4j:slf4j-log4j12:$slf4jVersion"
+        testCompile project(':ambry-router')
+        testCompile project(':ambry-cloud')
+        testCompile project(':ambry-test-utils')
+        testCompile project(path: ':ambry-cloud', configuration: 'testArchives')
+        testCompile project(path: ':ambry-clustermap', configuration: 'testArchives')
+        testCompile project(path: ':ambry-api', configuration: 'testArchives')
+        testCompile project(path: ':ambry-replication', configuration: 'testArchives')
+        testCompile project(path: ':ambry-messageformat', configuration: 'testArchives')
     }
 }
 
 project(':ambry-store') {
     dependencies {
         compile project(':ambry-api'),
-                project(':ambry-clustermap'),
-                project(':ambry-metrics'),
-                project(':ambry-utils')
-        compile "com.codahale.metrics:metrics-core:$metricsVersion"
-        testCompile project(':ambry-clustermap').sourceSets.test.output
-        testCompile project(':ambry-utils').sourceSets.test.output
+                project(':ambry-utils'),
+                project(':ambry-messageformat')
+        compile "net.smacke:jaydio:$jaydioVersion"
+        testCompile project(':ambry-clustermap')
+        testCompile project(':ambry-test-utils')
+        testCompile project(path: ':ambry-clustermap', configuration: 'testArchives')
+        testCompile project(path: ':ambry-api', configuration: 'testArchives')
     }
 }
 
@@ -160,8 +281,9 @@ project(':ambry-messageformat') {
     dependencies {
         compile project(':ambry-api'),
                 project(':ambry-utils')
-        compile "com.codahale.metrics:metrics-core:$metricsVersion"
-        testCompile project(':ambry-utils').sourceSets.test.output
+        compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
+        testCompile project(':ambry-test-utils')
+        testCompile project(path: ':ambry-api', configuration: 'testArchives')
     }
 }
 
@@ -169,45 +291,35 @@ project(':ambry-replication') {
     dependencies {
         compile project(':ambry-api'),
                 project(':ambry-utils'),
-                project(':ambry-store'),
                 project(':ambry-commons'),
                 project(':ambry-protocol'),
                 project(':ambry-network')
-        compile "com.codahale.metrics:metrics-core:$metricsVersion"
-        testCompile project(':ambry-clustermap').sourceSets.test.output
-        testCompile project(':ambry-utils').sourceSets.test.output
-    }
-}
-
-project(':ambry-coordinator') {
-    dependencies {
-        compile project(':ambry-api'),
-                project(':ambry-clustermap'),
-                project(':ambry-messageformat'),
-                project(':ambry-commons'),
-                project(':ambry-utils'),
-                project(':ambry-protocol'),
-                project(':ambry-network')
-        testCompile project(':ambry-clustermap').sourceSets.test.output
-        testCompile project(':ambry-network').sourceSets.test.output
+        compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
+        testCompile project(':ambry-store')
+        testCompile project(':ambry-test-utils')
+        testCompile project(path: ':ambry-clustermap', configuration: 'testArchives')
+        testCompile project(path: ':ambry-api', configuration: 'testArchives')
+        testCompile project(path: ':ambry-messageformat', configuration: 'testArchives')
+        testCompile project(path: ':ambry-store', configuration: 'testArchives')
     }
 }
 
 project(':ambry-tools') {
     dependencies {
         compile project(':ambry-api'),
+                project(':ambry-account'),
                 project(':ambry-store'),
-                project(':ambry-coordinator'),
+                project(':ambry-server'),
                 project(':ambry-rest'),
-                project(':ambry-admin'),
-                project(':ambry-frontend')
+                project(':ambry-frontend'),
+                project(':ambry-cloud')
+        compile "io.dropwizard.metrics:metrics-jmx:$metricsVersion"
         compile "net.sf.jopt-simple:jopt-simple:$joptSimpleVersion"
-    }
-}
-
-project(':ambry-metrics') {
-    dependencies {
-        compile project(':ambry-api')
+        testCompile project(':ambry-test-utils')
+        testCompile project(path: ':ambry-clustermap', configuration: 'testArchives')
+        testCompile project(path: ':ambry-account', configuration: 'testArchives')
+        testCompile project(path: ':ambry-store', configuration: 'testArchives')
+        testCompile project(path: ':ambry-api', configuration: 'testArchives')
     }
 }
 
@@ -218,37 +330,29 @@ project(':ambry-protocol') {
                 project(':ambry-messageformat'),
                 project(':ambry-utils'),
                 project(':ambry-commons')
-        testCompile project(':ambry-clustermap').sourceSets.test.output
+        testCompile project(':ambry-test-utils')
     }
 }
 
 project(':ambry-rest') {
     dependencies {
         compile project(':ambry-api'),
+                project(':ambry-account'),
                 project(':ambry-utils'),
                 project(':ambry-commons')
-        compile "com.codahale.metrics:metrics-core:$metricsVersion"
+        compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
+        compile "io.dropwizard.metrics:metrics-jmx:$metricsVersion"
         compile "net.sf.jopt-simple:jopt-simple:$joptSimpleVersion"
-        compile "io.netty:netty-all:4.0.25.Final"
+        compile "io.netty:netty-all:$nettyVersion"
+        compile "io.netty:netty-tcnative-boringssl-static:$nettyTcnativeVersion"
+        compile "io.netty:netty-transport-native-epoll:$nettyVersion"
         compile "javax.servlet:javax.servlet-api:$javaxVersion"
-        testCompile project(':ambry-api').sourceSets.test.output
-        testCompile project(':ambry-clustermap').sourceSets.test.output
-        testCompile project(':ambry-utils').sourceSets.test.output
-    }
-}
-
-project(':ambry-admin') {
-    dependencies {
-        compile project(':ambry-api'),
-                project(':ambry-utils'),
-                project(':ambry-commons'),
-                project(':ambry-rest'),
-                project(':ambry-router')
-        compile "com.codahale.metrics:metrics-core:$metricsVersion"
-        testCompile project(':ambry-api').sourceSets.test.output
-        testCompile project(':ambry-clustermap').sourceSets.test.output
-        testCompile project(':ambry-rest').sourceSets.test.output
-        testCompile project(':ambry-utils').sourceSets.test.output
+        runtimeOnly "log4j:log4j:$log4jVersion"
+        runtimeOnly "org.slf4j:slf4j-log4j12:$slf4jVersion"
+        testCompile project(':ambry-test-utils')
+        testCompile project(path: ':ambry-api', configuration: 'testArchives')
+        testCompile project(path: ':ambry-account', configuration: 'testArchives')
+        testCompile "org.bouncycastle:bcpkix-jdk15on:$bouncycastleVersion"
     }
 }
 
@@ -257,27 +361,65 @@ project(':ambry-router') {
         compile project(':ambry-api'),
                 project(':ambry-utils'),
                 project(':ambry-commons'),
-                project(':ambry-coordinator')
-        compile "com.codahale.metrics:metrics-core:$metricsVersion"
-        testCompile project(':ambry-api').sourceSets.test.output
-        testCompile project(':ambry-clustermap').sourceSets.test.output
-        testCompile project(':ambry-utils').sourceSets.test.output
-        testCompile project(':ambry-network').sourceSets.test.output
+                project(':ambry-clustermap'),
+                project(':ambry-messageformat'),
+                project(':ambry-protocol'),
+                project(':ambry-network'),
+                project(':ambry-cloud'),
+                project(':ambry-rest')
+        compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
+        compile "org.bouncycastle:bcpkix-jdk15on:$bouncycastleVersion"
+        compile "io.netty:netty-buffer:$nettyVersion"
+        testCompile project(':ambry-test-utils')
+        testCompile project(path: ':ambry-network', configuration: 'testArchives')
+        testCompile project(path: ':ambry-cloud', configuration: 'testArchives')
     }
 }
 
 project(':ambry-frontend') {
     dependencies {
         compile project(':ambry-api'),
+                project(':ambry-account'),
                 project(':ambry-utils'),
                 project(':ambry-commons'),
                 project(':ambry-rest'),
                 project(':ambry-router')
-        compile "com.codahale.metrics:metrics-core:$metricsVersion"
-        testCompile project(':ambry-api').sourceSets.test.output
-        testCompile project(':ambry-clustermap').sourceSets.test.output
-        testCompile project(':ambry-rest').sourceSets.test.output
-        testCompile project(':ambry-utils').sourceSets.test.output
+        compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
+        testCompile project(':ambry-test-utils')
+        testCompile project(path: ':ambry-api', configuration: 'testArchives')
+        testCompile project(path: ':ambry-rest', configuration: 'testArchives')
+    }
+}
+
+project(':ambry-cloud') {
+    dependencies {
+        compile project(':ambry-api'),
+            project(':ambry-utils'),
+            project(':ambry-commons'),
+            project(':ambry-replication')
+        compile "com.azure:azure-storage-blob:$azureStorageVersion"
+        compile "com.azure:azure-storage-blob-batch:$azureStorageVersion"
+        compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
+        compile "io.dropwizard.metrics:metrics-jmx:$metricsVersion"
+        compile "com.microsoft.azure:azure-cosmosdb:$azureCosmosDbVersion"
+        testCompile project(':ambry-router')
+        testCompile project(':ambry-store')
+        testCompile project(':ambry-test-utils')
+        testCompile project(path: ':ambry-clustermap', configuration: 'testArchives')
+        testCompile project(path: ':ambry-store', configuration: 'testArchives')
+        testCompile project(path: ':ambry-replication', configuration: 'testArchives')
+    }
+}
+
+project(':ambry-all') {
+    dependencies {
+        // this is a meta project that depends on all of the "entry-point" subprojects to make it easier to pull in the
+        // entire dependency tree.
+        compile project(':ambry-frontend')
+        compile project(':ambry-server')
+        compile project(':ambry-tools')
+        compile project(':ambry-cloud')
+        compile project(':ambry-test-utils')
     }
 }
 
@@ -288,6 +430,7 @@ task allJar(type: Jar, dependsOn: subprojects.assemble) {
         attributes 'Implementation-Title': 'Ambry',
                    'Main-Class': 'com.github.ambry.server.AmbryMain'
     }
+    zip64 true
     destinationDir = file('target')
     baseName = 'ambry'
     subprojects.each { subproject ->
@@ -296,5 +439,47 @@ task allJar(type: Jar, dependsOn: subprojects.assemble) {
                 zipTree(it)
             }
         }
+    }
+    exclude 'META-INF/*.RSA', 'META-INF/*.SF','META-INF/*.DSA'
+}
+
+task allJarVcr(type: Jar, dependsOn: subprojects.assemble) {
+    manifest {
+        attributes 'Implementation-Title': 'Vcr',
+                   'Main-Class': 'com.github.ambry.cloud.VcrMain'
+    }
+    zip64 true
+    destinationDir = file('target')
+    baseName = 'ambry-vcr'
+    subprojects.each { subproject ->
+        from  {
+            (subproject.configurations.archives.allArtifacts.files + subproject.configurations.runtime).collect {
+                zipTree(it)
+            }
+        }
+    }
+    exclude 'META-INF/*.RSA', 'META-INF/*.SF','META-INF/*.DSA'
+}
+
+task codeCoverageReport(type: JacocoReport) {
+    executionData fileTree(project.rootDir.absolutePath).include("**/build/jacoco/*.exec")
+
+    subprojects.each {
+        sourceSets it.sourceSets.main
+    }
+
+    reports {
+        xml.enabled true
+        xml.destination file("${buildDir}/reports/jacoco/report.xml")
+        html.enabled true
+        csv.enabled true
+    }
+}
+codeCoverageReport.dependsOn subprojects*.allTest
+
+if (hasProperty('buildScan')) {
+    buildScan {
+        termsOfServiceUrl = 'https://gradle.com/terms-of-service'
+        termsOfServiceAgree = 'yes'
     }
 }

@@ -8,19 +8,21 @@
 // under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
 // CONDITIONS OF ANY KIND, either express or implied.
 include 'ambry-api',
+        'ambry-account',
         'ambry-server',
         'ambry-network',
         'ambry-utils',
+        'ambry-test-utils',
         'ambry-store',
         'ambry-commons',
         'ambry-messageformat',
         'ambry-replication',
-        'ambry-coordinator',
         'ambry-clustermap',
         'ambry-tools',
-        'ambry-metrics',
         'ambry-protocol',
         'ambry-rest',
-        'ambry-admin',
         'ambry-router',
-        'ambry-frontend'
+        'ambry-frontend',
+        'ambry-cloud',
+        'log4j-test-config',
+        'ambry-all'

@@ -1,0 +1,25 @@
+language: java
+dist: trusty
+sudo: required
+jdk:
+  - oraclejdk8
+before_cache:
+  - rm -f  $HOME/.gradle/caches/modules-2/modules-2.lock
+  - rm -fr $HOME/.gradle/caches/*/plugin-resolution/
+cache:
+  directories:
+    - $HOME/.gradle/caches/
+    - $HOME/.gradle/wrapper/
+addons:
+  apt:
+    packages:
+      - oracle-java8-installer
+      - oracle-java8-unlimited-jce-policy
+branches:
+  except: # don't build tags
+    - /^v\d/
+install: skip # skips unnecessary ./gradlew assemble (https://docs.travis-ci.com/user/job-lifecycle/#skipping-the-installation-phase) 
+script:
+  - ./travis-build.sh
+after_success:
+  - bash <(curl -s https://codecov.io/bash)
